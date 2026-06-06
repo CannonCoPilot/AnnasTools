@@ -567,6 +567,61 @@ def lookupDoi(doi: str) -> str:
     return json.dumps({"doi": doi, "results": results, "count": len(results)})
 
 
+@mcp.tool()
+def lookupISBN(isbn: str) -> str:
+    """Look up a book by ISBN-10 or ISBN-13 and return full metadata.
+
+    Searches Anna's Archive for the exact ISBN, then enriches the top
+    results with full metadata (title, author, publisher, year, description,
+    cover URL, all identifiers, filesize, format, and download availability).
+
+    Args:
+        isbn: ISBN-10 (10 digits) or ISBN-13 (13 digits), with or without hyphens
+    """
+    clean = re.sub(r'[\s-]', '', isbn)
+    if len(clean) == 10:
+        isbn_type = "isbn10"
+    elif len(clean) == 13:
+        isbn_type = "isbn13"
+    else:
+        return json.dumps({"error": "INVALID_ISBN", "message": f"Expected 10 or 13 digits, got {len(clean)}", "isbn": isbn})
+
+    base = _get_base_url()
+    url = f"{base}/search?{urllib.parse.urlencode({'q': clean})}"
+    html = _fetch(url)
+
+    if not html:
+        return json.dumps({"error": "UPSTREAM_UNAVAILABLE", "isbn": isbn})
+
+    md5s = list(dict.fromkeys(re.findall(r'/md5/([a-f0-9]{32})', html)))
+    if not md5s:
+        return json.dumps({"error": "NOT_FOUND", "isbn": isbn, "isbn_type": isbn_type, "message": "No files found for this ISBN"})
+
+    results = []
+    for md5 in md5s[:5]:
+        detail = json.loads(info(md5))
+        if detail.get("error"):
+            continue
+        ids = detail.get("identifiers", {})
+        matched_isbns = ids.get(isbn_type, [])
+        if clean in matched_isbns:
+            detail["isbn_match"] = "exact"
+        else:
+            all_isbns = ids.get("isbn13", []) + ids.get("isbn10", [])
+            detail["isbn_match"] = "exact" if clean in all_isbns else "fuzzy"
+        results.append(detail)
+
+    results.sort(key=lambda r: (0 if r.get("isbn_match") == "exact" else 1))
+
+    return json.dumps({
+        "isbn": isbn,
+        "isbn_type": isbn_type,
+        "results": results,
+        "count": len(results),
+        "exact_matches": sum(1 for r in results if r.get("isbn_match") == "exact"),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Text extraction, search, and RAG integration
 # ---------------------------------------------------------------------------
