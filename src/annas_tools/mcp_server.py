@@ -679,9 +679,11 @@ def lookupISBN(isbn: str) -> str:
 
 def _extract_epub_text(filepath: Path) -> str:
     """Extract plain text from an EPUB file using ebooklib + BeautifulSoup."""
+    import warnings
     import ebooklib
     from ebooklib import epub
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
     book = epub.read_epub(str(filepath), options={"ignore_ncx": True})
     texts = []
