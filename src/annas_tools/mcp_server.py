@@ -406,8 +406,43 @@ def fastDownload(md5: str, path_index: int = 0, domain_index: int = 0) -> str:
     return json.dumps({"download_url": download_url, "md5": md5})
 
 
-def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0, domain_index: int = 0) -> dict:
-    """Internal: download a file via fast_download API with atomic write."""
+def _sanitize_path_component(s: str) -> str:
+    """Clean a string for use as a directory or file name."""
+    s = re.sub(r'[<>:"/\\|?*]', '_', s)
+    s = re.sub(r'\s+', ' ', s).strip().rstrip('.')
+    return s[:120] if s else "Unknown"
+
+
+def _resolve_organized_dest(md5: str, base_dir: Path) -> tuple[Path, str | None, str | None]:
+    """Look up metadata and return (dest_dir, author, title) for organized storage."""
+    raw = info(md5)
+    try:
+        meta = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return base_dir, None, None
+
+    if meta.get("error"):
+        return base_dir, None, None
+
+    author = meta.get("author", "").strip()
+    title = meta.get("title", "").strip()
+
+    if not author and not title:
+        return base_dir, None, None
+
+    author_dir = _sanitize_path_component(author) if author else "Unknown Author"
+    title_dir = _sanitize_path_component(title) if title else md5
+
+    dest = base_dir / author_dir / title_dir
+    return dest, author, title
+
+
+def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0, domain_index: int = 0, organize: bool = True) -> dict:
+    """Internal: download a file via fast_download API with atomic write.
+
+    When organize=True (default), files are saved to Author/Title/ subdirectories
+    within the download path, using metadata from the info tool.
+    """
     global _download_count
 
     key = _get_secret_key()
@@ -439,7 +474,15 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
     if not download_url:
         return {"error": "NO_DOWNLOAD_URL", "md5": md5}
 
-    dest = output_dir or _get_download_path()
+    base_dest = output_dir or _get_download_path()
+    author_name = None
+    title_name = None
+
+    if organize:
+        dest, author_name, title_name = _resolve_organized_dest(md5, base_dest)
+    else:
+        dest = base_dest
+
     dest.mkdir(parents=True, exist_ok=True)
 
     filename = urllib.parse.unquote(download_url.split("/")[-1].split("?")[0])
@@ -455,6 +498,8 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
             "success": True,
             "filepath": str(filepath),
             "filename": filename,
+            "author": author_name,
+            "title": title_name,
             "skipped": True,
             "message": "File already exists",
         }
@@ -467,6 +512,8 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
             "success": True,
             "filepath": str(filepath),
             "filename": filename,
+            "author": author_name,
+            "title": title_name,
             "filesize_bytes": filepath.stat().st_size,
             "downloads_this_session": _download_count,
         }
@@ -476,34 +523,38 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
 
 
 @mcp.tool()
-def downloadBook(md5: str, output_path: str | None = None, path_index: int = 0, domain_index: int = 0) -> str:
+def downloadBook(md5: str, output_path: str | None = None, path_index: int = 0, domain_index: int = 0, organize: bool = True) -> str:
     """Download a book by MD5 hash using the fast download API.
 
-    Saves to ANNAS_DOWNLOAD_PATH or the specified output_path.
+    By default, saves to Author/Title/ subdirectories within ANNAS_DOWNLOAD_PATH.
     Uses atomic writes (temp file + rename) to prevent partial files.
     Skips if the file already exists.
 
     Args:
         md5: 32-character MD5 hash from a search result
-        output_path: Directory to save file (default: ANNAS_DOWNLOAD_PATH)
+        output_path: Base directory to save file (default: ANNAS_DOWNLOAD_PATH)
         path_index: Storage path index (default: 0)
         domain_index: Download server index (default: 0)
+        organize: Create Author/Title/ subdirectories (default: true)
     """
     dest = Path(output_path) if output_path else None
-    result = _download_file(md5, output_dir=dest, path_index=path_index, domain_index=domain_index)
+    result = _download_file(md5, output_dir=dest, path_index=path_index, domain_index=domain_index, organize=organize)
     return json.dumps(result)
 
 
 @mcp.tool()
-def downloadJournal(md5: str, output_path: str | None = None) -> str:
+def downloadJournal(md5: str, output_path: str | None = None, organize: bool = True) -> str:
     """Download a journal article by MD5 hash.
+
+    By default, saves to Author/Title/ subdirectories within ANNAS_DOWNLOAD_PATH.
 
     Args:
         md5: 32-character MD5 hash from a search result
-        output_path: Directory to save file (default: ANNAS_DOWNLOAD_PATH)
+        output_path: Base directory to save file (default: ANNAS_DOWNLOAD_PATH)
+        organize: Create Author/Title/ subdirectories (default: true)
     """
     dest = Path(output_path) if output_path else None
-    result = _download_file(md5, output_dir=dest)
+    result = _download_file(md5, output_dir=dest, organize=organize)
     return json.dumps(result)
 
 
