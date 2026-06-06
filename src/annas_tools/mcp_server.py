@@ -567,5 +567,221 @@ def lookupDoi(doi: str) -> str:
     return json.dumps({"doi": doi, "results": results, "count": len(results)})
 
 
+# ---------------------------------------------------------------------------
+# Text extraction, search, and RAG integration
+# ---------------------------------------------------------------------------
+
+def _extract_epub_text(filepath: Path) -> str:
+    """Extract plain text from an EPUB file using ebooklib + BeautifulSoup."""
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+
+    book = epub.read_epub(str(filepath), options={"ignore_ncx": True})
+    texts = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        soup = BeautifulSoup(item.get_content(), "lxml")
+        text = soup.get_text(separator="\n", strip=True)
+        if text:
+            texts.append(text)
+    return "\n\n".join(texts)
+
+
+def _extract_pdf_text(filepath: Path) -> str:
+    """Extract plain text from a PDF file using PyMuPDF."""
+    import fitz
+
+    doc = fitz.open(str(filepath))
+    texts = []
+    for page in doc:
+        text = page.get_text()
+        if text.strip():
+            texts.append(text)
+    doc.close()
+    return "\n\n".join(texts)
+
+
+def _extract_text(filepath: Path) -> tuple[str, str]:
+    """Extract text from a file. Returns (text, format)."""
+    suffix = filepath.suffix.lower()
+    if suffix == ".epub":
+        return _extract_epub_text(filepath), "epub"
+    elif suffix == ".pdf":
+        return _extract_pdf_text(filepath), "pdf"
+    elif suffix in (".txt", ".md", ".rst"):
+        return filepath.read_text(encoding="utf-8", errors="replace"), suffix.lstrip(".")
+    else:
+        raise ValueError(f"Unsupported format: {suffix}. Supported: epub, pdf, txt, md")
+
+
+@mcp.tool()
+def extractText(
+    filepath: str,
+    max_chars: int = 0,
+    output_path: str | None = None,
+) -> str:
+    """Extract plain text from an ebook file (EPUB, PDF, TXT).
+
+    Returns extracted text content. For large files, use max_chars to truncate
+    or output_path to save to a file instead of returning inline.
+
+    Args:
+        filepath: Path to the ebook file (epub, pdf, txt, md)
+        max_chars: Max characters to return (0 = unlimited). Use for previews
+        output_path: Save extracted text to this file instead of returning inline
+    """
+    p = Path(filepath)
+    if not p.exists():
+        return json.dumps({"error": "FILE_NOT_FOUND", "filepath": filepath})
+
+    try:
+        text, fmt = _extract_text(p)
+    except ValueError as e:
+        return json.dumps({"error": "UNSUPPORTED_FORMAT", "message": str(e)})
+    except Exception as e:
+        return json.dumps({"error": "EXTRACTION_FAILED", "message": str(e), "filepath": filepath})
+
+    char_count = len(text)
+    word_count = len(text.split())
+
+    if output_path:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        return json.dumps({
+            "success": True,
+            "output_path": str(out),
+            "source_format": fmt,
+            "char_count": char_count,
+            "word_count": word_count,
+        })
+
+    if max_chars and char_count > max_chars:
+        text = text[:max_chars]
+
+    return json.dumps({
+        "text": text,
+        "source_format": fmt,
+        "char_count": char_count,
+        "word_count": word_count,
+        "truncated": bool(max_chars and char_count > max_chars),
+    })
+
+
+@mcp.tool()
+def searchText(
+    filepath: str,
+    query: str,
+    context_chars: int = 200,
+    max_results: int = 10,
+) -> str:
+    """Search within an ebook file for text matching a query.
+
+    Extracts text from the file and finds all occurrences of the query,
+    returning surrounding context for each match.
+
+    Args:
+        filepath: Path to the ebook file (epub, pdf, txt, md)
+        query: Text to search for (case-insensitive)
+        context_chars: Characters of context to show around each match (default: 200)
+        max_results: Maximum matches to return (default: 10)
+    """
+    p = Path(filepath)
+    if not p.exists():
+        return json.dumps({"error": "FILE_NOT_FOUND", "filepath": filepath})
+
+    try:
+        text, fmt = _extract_text(p)
+    except Exception as e:
+        return json.dumps({"error": "EXTRACTION_FAILED", "message": str(e)})
+
+    lower_text = text.lower()
+    lower_query = query.lower()
+    matches = []
+    start = 0
+
+    while len(matches) < max_results:
+        idx = lower_text.find(lower_query, start)
+        if idx == -1:
+            break
+        ctx_start = max(0, idx - context_chars)
+        ctx_end = min(len(text), idx + len(query) + context_chars)
+        matches.append({
+            "position": idx,
+            "context": text[ctx_start:ctx_end],
+        })
+        start = idx + len(query)
+
+    return json.dumps({
+        "query": query,
+        "source": filepath,
+        "source_format": fmt,
+        "total_matches": len(matches),
+        "matches": matches,
+    })
+
+
+@mcp.tool()
+def chunkForRAG(
+    filepath: str,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 200,
+) -> str:
+    """Extract text from an ebook and split into chunks suitable for RAG ingestion.
+
+    Returns chunks with metadata (source file, chunk index, total chunks).
+    Each chunk is sized for embedding models (default 1000 chars with 200 overlap).
+    Output can be piped to a vector DB ingestion endpoint.
+
+    Args:
+        filepath: Path to the ebook file (epub, pdf, txt)
+        chunk_size: Characters per chunk (default: 1000, matches jarvis-rag)
+        chunk_overlap: Overlap between chunks (default: 200)
+    """
+    p = Path(filepath)
+    if not p.exists():
+        return json.dumps({"error": "FILE_NOT_FOUND", "filepath": filepath})
+
+    try:
+        text, fmt = _extract_text(p)
+    except Exception as e:
+        return json.dumps({"error": "EXTRACTION_FAILED", "message": str(e)})
+
+    chunks = []
+    pos = 0
+    while pos < len(text):
+        end = pos + chunk_size
+        chunk_text = text[pos:end]
+
+        # Try to break at sentence boundary
+        if end < len(text):
+            for sep in [". ", ".\n", "! ", "? ", "\n\n"]:
+                last_sep = chunk_text.rfind(sep)
+                if last_sep > chunk_size * 0.5:
+                    chunk_text = chunk_text[:last_sep + len(sep)]
+                    end = pos + len(chunk_text)
+                    break
+
+        if chunk_text.strip():
+            chunks.append({
+                "text": chunk_text.strip(),
+                "chunk_index": len(chunks),
+                "char_offset": pos,
+            })
+
+        pos = end - chunk_overlap if end < len(text) else end
+
+    return json.dumps({
+        "source": filepath,
+        "source_format": fmt,
+        "total_chunks": len(chunks),
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "total_chars": len(text),
+        "total_words": len(text.split()),
+        "chunks": chunks,
+    })
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
