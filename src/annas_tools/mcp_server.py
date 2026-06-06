@@ -235,6 +235,72 @@ def searchJournal(
     return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain})
 
 
+def _parse_md5_page(md5: str, html: str) -> dict:
+    """Extract rich metadata from an /md5/{hash} HTML page."""
+    result: dict = {"md5": md5, "source": "html_fallback"}
+
+    title_m = re.search(r'text-violet-900[^>]*data-content="([^"]+)"', html)
+    if not title_m:
+        title_m = re.search(r'<title>([^<]+)', html)
+        result["title"] = title_m.group(1).replace(" - Anna’s Archive", "").replace(" - Anna's Archive", "").strip() if title_m else "Unknown"
+    else:
+        result["title"] = title_m.group(1).strip()
+
+    author_m = re.search(r'text-amber-900[^>]*data-content="([^"]+)"', html)
+    if author_m:
+        result["author"] = author_m.group(1).strip()
+
+    pub_m = re.search(r'icon-\[mdi--company\][^>]*></span>\s*([^<]+)</a>', html)
+    if pub_m:
+        pub_text = pub_m.group(1).strip()
+        result["publisher"] = pub_text
+        year_m = re.search(r'\b(19|20)\d{2}\b', pub_text)
+        if year_m:
+            result["year"] = year_m.group(0)
+
+    desc_m = re.search(r'js-md5-top-box-description[^>]*>(?:<div[^>]*>[^<]*</div>)?<div[^>]*>([^<]+)', html)
+    if desc_m:
+        result["description"] = desc_m.group(1).strip()[:500]
+
+    cover_m = re.search(r'<img[^>]*object-cover[^>]*src="([^"]+)"', html)
+    if cover_m:
+        result["cover_url"] = cover_m.group(1)
+
+    isbn13s = list(dict.fromkeys(re.findall(r'isbn13:(\d{13})', html)))
+    isbn10s = list(dict.fromkeys(re.findall(r'isbn10:(\d{10})', html)))
+    dois = list(dict.fromkeys(
+        d.rstrip('“”"\'') for d in re.findall(r'doi:(10\.\d{4,}/[^"&<\s]+)', html)
+    ))
+    if isbn13s or isbn10s or dois:
+        result["identifiers"] = {}
+        if isbn13s:
+            result["identifiers"]["isbn13"] = isbn13s
+        if isbn10s:
+            result["identifiers"]["isbn10"] = isbn10s
+        if dois:
+            result["identifiers"]["doi"] = dois
+
+    filesize_m = re.search(r'filesize_bytes:(\d+)', html)
+    if filesize_m:
+        result["filesize_bytes"] = int(filesize_m.group(1))
+
+    lang_codes = list(dict.fromkeys(re.findall(r'"lang:([a-z]{2})"', html)))
+    if lang_codes:
+        result["language_codes"] = lang_codes
+
+    filepath_m = re.search(r'Filepath</span><span[^>]*>([^<]+)', html)
+    if filepath_m:
+        ext_m = re.search(r'\.(\w+)$', filepath_m.group(1).strip())
+        if ext_m:
+            result["extension"] = ext_m.group(1).lower()
+
+    alt_pubs = re.findall(r'Alternative publisher</div><div[^>]*>([^<]+)', html)
+    if alt_pubs:
+        result["alternative_publishers"] = alt_pubs
+
+    return result
+
+
 @mcp.tool()
 def info(md5: str) -> str:
     """Get detailed metadata for a book or journal by its MD5 hash.
@@ -254,12 +320,7 @@ def info(md5: str) -> str:
         html = _fetch(url_fallback)
         if not html:
             return json.dumps({"error": "NOT_FOUND", "md5": md5})
-        title_match = re.search(r'<title>([^<]+)', html)
-        return json.dumps({
-            "md5": md5,
-            "title": title_match.group(1).replace(" - Anna's Archive", "").strip() if title_match else "Unknown",
-            "source": "html_fallback",
-        })
+        return json.dumps(_parse_md5_page(md5, html))
 
     try:
         data = json.loads(raw)
