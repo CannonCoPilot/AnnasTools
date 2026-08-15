@@ -30,10 +30,18 @@ mcp = FastMCP(
     instructions="Anna's Archive — ebook and article search, metadata, and download. Use searchBook/searchJournal to find content, info for metadata, and downloadBook/downloadJournal/memberDownload to retrieve files.",
 )
 
+# TRUSTED MIRRORS. Membership here is a CREDENTIAL DECISION, not a convenience list: the member
+# key is sent to whichever of these wins selection, as a URL query parameter (Anna's API takes it
+# that way), so a hostile or unrelated entry here receives a paid credential in a logged URL.
+#
+# REMOVED 2026-08-15: "annas-archive.li" — it is NOT Anna's Archive. Verified live from this
+# machine: 1,015 bytes, <title>annas-archive.li</title>, zero /md5/ links, and a parking script
+# from assets.abovedomains.com with "This domain may be for sale." A real mirror answers ~177 KB
+# of Anna's markup (.gl/.pk/.gd all do). It had been trusted since the first commit (2026-06-05).
+# Reported by W12:Genie; independently re-verified here before removal.
 MIRROR_DOMAINS = [
     "annas-archive.gl",
     "annas-archive.org",
-    "annas-archive.li",
     "annas-archive.se",
     "annas-archive.pk",
     "annas-archive.gd",
