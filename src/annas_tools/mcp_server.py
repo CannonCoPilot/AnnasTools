@@ -41,25 +41,101 @@ MIRROR_DOMAINS = [
 
 _working_domain: str | None = None
 _download_count: int = 0
+# Per-domain probe verdicts from the last selection sweep: {domain: cause}. Kept so a failure
+# can say WHY each mirror was rejected instead of collapsing six different worlds into one
+# unfalsifiable "could not reach any mirror".
+_probe_report: dict[str, str] = {}
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
 
-def _get_base_url() -> str:
+def _probe_domain(domain: str) -> tuple[bool, str]:
+    """Probe a mirror and return (usable, cause).
+
+    PROBE THE ENDPOINT YOU ACTUALLY USE. The previous version probed `/`, but `/` is not what
+    this server ever requests — and the two disagree. Measured 2026-08-15:
+
+        .gl  /=200  /search -> 302 -> ?check=1 -> 403 DDoS-Guard JS challenge
+        .pk  /=200  /search -> 302 (same)
+        .gd  /=200  /search -> 302 (same)
+        .li  /=200  /search=200 but ZERO results (JS interstitial body)
+        .org/.se  DNS dead
+
+    So every mirror passed the old `/` probe, and the first one — `.gl` — was cached forever
+    while being incapable of serving a single search.
+
+    A 200 IS NOT A RESULT. `.li` answers 200 with an interstitial containing no /md5/ links, so
+    status alone cannot decide usability; the probe requires actual parseable content. This is
+    the same lesson as a boolean health check that reports "up" for a service returning errors.
+    """
+    url = f"https://{domain}/search?q=test"
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        # urlopen FOLLOWS redirects, so a 302 to a challenge page arrives here as the challenge,
+        # not as an exception — which is exactly how this failure stayed invisible.
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                return False, f"http-{resp.status}"
+            body = resp.read().decode("utf-8", errors="replace")
+            if re.search(r"/md5/[a-f0-9]{32}", body):
+                return True, "ok"
+            low = body.lower()
+            if "ddos-guard" in low or "js-challenge" in low or "fingerprint" in low:
+                return False, "anti-bot-challenge"
+            return False, "200-but-no-results"
+    except urllib.error.HTTPError as e:
+        return False, f"http-{e.code}"
+    except urllib.error.URLError as e:
+        reason = str(getattr(e, "reason", e))
+        if "Name or service not known" in reason or "nodename nor servname" in reason:
+            return False, "dns-dead"
+        return False, f"unreachable ({reason[:40]})"
+    except Exception as e:  # noqa: BLE001 — cause is reported, never swallowed
+        return False, f"error ({type(e).__name__})"
+
+
+def _get_base_url() -> str | None:
+    """Return a base URL for a mirror that can actually serve searches, or None.
+
+    RETURNS None WHEN NOTHING WORKS. The previous version ended with
+    `_working_domain = MIRROR_DOMAINS[0]` — recording a working mirror when every probe had
+    FAILED. Absence of a usable mirror is not a usable mirror, and that fallback is what turned
+    a total outage into a confident lock onto a dead domain.
+    """
     global _working_domain
     if _working_domain:
         return f"https://{_working_domain}"
+    _probe_report.clear()
     for domain in MIRROR_DOMAINS:
-        try:
-            req = urllib.request.Request(f"https://{domain}/", headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    _working_domain = domain
-                    return f"https://{domain}"
-        except Exception:
-            continue
-    _working_domain = MIRROR_DOMAINS[0]
-    return f"https://{_working_domain}"
+        ok, cause = _probe_domain(domain)
+        _probe_report[domain] = cause
+        if ok:
+            _working_domain = domain
+            return f"https://{domain}"
+    return None
+
+
+def _upstream_error(action: str = "reach a mirror") -> str:
+    """A failure that names each mirror's cause, so the remedy is decidable from the message."""
+    detail = ", ".join(f"{d}: {c}" for d, c in _probe_report.items()) or "no probe run"
+    hint = ""
+    # Judge only the REACHABLE mirrors. A first version required EVERY cause to be
+    # challenge-like, so two dns-dead domains suppressed the hint in the exact situation it
+    # describes — every mirror we can still reach is challenge-gated. Unreachable hosts say
+    # nothing about whether access is being refused, so they must not vote.
+    def _blocked(c: str) -> bool:
+        return c in ("anti-bot-challenge", "200-but-no-results") or c.startswith("http-40")
+
+    reachable = [c for c in _probe_report.values() if c != "dns-dead" and not c.startswith("unreachable")]
+    if reachable and all(_blocked(c) for c in reachable):
+        hint = (" Every reachable mirror is behind an anti-bot challenge requiring JS execution."
+                " That is an access control, not a transport fault — retrying will not help."
+                " For open-access papers use Unpaywall (api.unpaywall.org/v2/<doi>?email=...).")
+    return json.dumps({
+        "error": "UPSTREAM_UNAVAILABLE",
+        "message": f"Could not {action}.{hint}",
+        "mirror_causes": detail,
+    })
 
 
 def _get_secret_key() -> str | None:
@@ -73,11 +149,22 @@ def _get_download_path() -> Path:
 
 
 def _fetch(url: str) -> str | None:
+    """Fetch a URL, INVALIDATING the cached mirror on failure.
+
+    Previously a cached domain was permanent: once `_working_domain` was set, every later
+    request went to it forever, and a bare `except: return None` erased the reason. So a mirror
+    that started failing after selection failed for the remainder of the process lifetime with
+    no cause and no failover. Clearing the cache lets the next call re-probe and move on.
+    """
+    global _working_domain
     req = urllib.request.Request(url, headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8")
-    except (urllib.error.HTTPError, urllib.error.URLError):
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        if _working_domain and _working_domain in url:
+            _probe_report[_working_domain] = f"fetch-failed ({getattr(e, 'code', None) or getattr(e, 'reason', 'error')})"
+            _working_domain = None
         return None
 
 
@@ -137,7 +224,7 @@ def _build_search_url(
     ext: str | None = None,
     lang: str | None = None,
     sort: str | None = None,
-) -> str:
+) -> str | None:
     params: dict[str, str] = {"q": query}
     if ext:
         params["ext"] = ext
@@ -162,6 +249,8 @@ def _build_search_url(
         params["content"] = ct_map.get(content_type, content_type)
 
     base = _get_base_url()
+    if base is None:
+        return None
     return f"{base}/search?{urllib.parse.urlencode(params)}"
 
 
@@ -190,12 +279,14 @@ def searchBook(
     """
     search_query = f"{q} {author}" if author else q
     url = _build_search_url(search_query, content_type=cat, ext=ext, lang=lang, sort=sort)
+    if url is None:
+        return _upstream_error("search for books")
     if page > 1:
         url += f"&page={page}"
 
     html = _fetch(url)
     if not html:
-        return json.dumps({"error": "UPSTREAM_UNAVAILABLE", "message": f"Could not reach {_working_domain or 'any mirror'}"})
+        return _upstream_error("search for books")
 
     results = _parse_search_results(html, limit=min(limit, 20))
     return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain})
@@ -224,12 +315,14 @@ def searchJournal(
     """
     search_query = f"{q} {author}" if author else q
     url = _build_search_url(search_query, content_type="journal_article", ext=ext, lang=lang, sort=sort)
+    if url is None:
+        return _upstream_error("search for journal articles")
     if page > 1:
         url += f"&page={page}"
 
     html = _fetch(url)
     if not html:
-        return json.dumps({"error": "UPSTREAM_UNAVAILABLE", "message": "Could not reach any mirror"})
+        return _upstream_error("search for journal articles")
 
     results = _parse_search_results(html, limit=min(limit, 20))
     return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain})
@@ -312,6 +405,8 @@ def info(md5: str) -> str:
         md5: 32-character MD5 hash from a search result
     """
     base = _get_base_url()
+    if base is None:
+        return _upstream_error("fetch metadata")
     url = f"{base}/db/aarecord_elasticsearch/md5:{md5}.json"
     raw = _fetch(url)
 
@@ -382,6 +477,8 @@ def fastDownload(md5: str, path_index: int = 0, domain_index: int = 0) -> str:
 
     params = {"md5": md5, "key": key, "path_index": path_index, "domain_index": domain_index}
     base = _get_base_url()
+    if base is None:
+        return _upstream_error("request a fast download")
     url = f"{base}/dyn/api/fast_download.json?{urllib.parse.urlencode(params)}"
 
     raw = _fetch(url)
@@ -451,6 +548,8 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
 
     params = {"md5": md5, "key": key, "path_index": path_index, "domain_index": domain_index}
     base = _get_base_url()
+    if base is None:
+        return json.loads(_upstream_error("request a fast download"))
     api_url = f"{base}/dyn/api/fast_download.json?{urllib.parse.urlencode(params)}"
 
     raw = _fetch(api_url)
@@ -599,6 +698,8 @@ def lookupDoi(doi: str) -> str:
         doi: Digital Object Identifier (e.g., 10.1038/nature12373)
     """
     base = _get_base_url()
+    if base is None:
+        return _upstream_error("reach SciDB")
     url = f"{base}/scidb/{urllib.parse.quote(doi, safe='')}"
     html = _fetch(url)
 
@@ -638,6 +739,8 @@ def lookupISBN(isbn: str) -> str:
         return json.dumps({"error": "INVALID_ISBN", "message": f"Expected 10 or 13 digits, got {len(clean)}", "isbn": isbn})
 
     base = _get_base_url()
+    if base is None:
+        return _upstream_error("search by ISBN")
     url = f"{base}/search?{urllib.parse.urlencode({'q': clean})}"
     html = _fetch(url)
 
