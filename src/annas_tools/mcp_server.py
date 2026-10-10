@@ -13,7 +13,7 @@ Tools:
   - lookupDoi: Resolve a DOI to metadata and download options
 
 Requires ANNAS_SECRET_KEY env var for download tools.
-Requires ANNAS_DOWNLOAD_PATH env var for file save location (default: ~/Downloads/annas-archive).
+Requires ANNAS_DOWNLOAD_PATH env var for file save location (default: ~/Claude/Staging/incoming/annas-archive).
 """
 
 import json
@@ -47,7 +47,13 @@ MIRROR_DOMAINS = [
     "annas-archive.gd",
 ]
 
-_working_domain: str | None = None
+# One cached mirror PER PURPOSE. A single global cache let the search probe decide for every
+# endpoint, and search is the one endpoint behind DDoS-Guard (measured 2026-10-09, .gl/.pk/.gd:
+# /search -> 302 ?check=1 JS challenge, while /dyn/api/fast_download.json answers JSON and
+# /db/... answers JSON). So downloads and metadata failed without ever being attempted.
+#   "search": HTML search/scidb pages -> probed with /search (challenge-gated today)
+#   "api":    member JSON API (fast_download, /db) -> probed WITHOUT the key, JSON 4xx = reachable
+_working_domain: dict[str, str | None] = {"search": None, "api": None}
 _download_count: int = 0
 # Per-domain probe verdicts from the last selection sweep: {domain: cause}. Kept so a failure
 # can say WHY each mirror was rejected instead of collapsing six different worlds into one
@@ -102,25 +108,51 @@ def _probe_domain(domain: str) -> tuple[bool, str]:
         return False, f"error ({type(e).__name__})"
 
 
-def _get_base_url() -> str | None:
-    """Return a base URL for a mirror that can actually serve searches, or None.
+def _probe_api(domain: str) -> tuple[bool, str]:
+    """Probe the member JSON API WITHOUT the key. A JSON reply of any status is "reachable".
+
+    Without a key the API answers 401 with its own JSON documentation; that proves the endpoint
+    is live and not challenge-gated, which is all selection needs. NEVER send the key in a probe:
+    a probe goes to every allow-listed domain in turn, and the key belongs only to the one used.
+    """
+    status, body, ctype = _http(f"https://{domain}/dyn/api/fast_download.json?md5={'0' * 32}")
+    if status is None:
+        return False, body  # transport cause
+    if "json" in ctype:
+        return True, f"ok (json {status})"
+    low = body.lower()
+    if "ddos-guard" in low or "check=1" in low or "js-challenge" in low:
+        return False, "anti-bot-challenge"
+    return False, f"http-{status}-not-json"
+
+
+def _get_base_url(purpose: str = "search") -> str | None:
+    """Return a base URL for a mirror that can serve `purpose` ("search" or "api"), or None.
 
     RETURNS None WHEN NOTHING WORKS. The previous version ended with
     `_working_domain = MIRROR_DOMAINS[0]` — recording a working mirror when every probe had
     FAILED. Absence of a usable mirror is not a usable mirror, and that fallback is what turned
     a total outage into a confident lock onto a dead domain.
     """
-    global _working_domain
-    if _working_domain:
-        return f"https://{_working_domain}"
+    if _working_domain.get(purpose):
+        return f"https://{_working_domain[purpose]}"
+    probe = _probe_api if purpose == "api" else _probe_domain
     _probe_report.clear()
     for domain in MIRROR_DOMAINS:
-        ok, cause = _probe_domain(domain)
-        _probe_report[domain] = cause
+        ok, cause = probe(domain)
+        _probe_report[domain] = f"{purpose}: {cause}"
         if ok:
-            _working_domain = domain
+            _working_domain[purpose] = domain
             return f"https://{domain}"
     return None
+
+
+def _invalidate(url: str, cause: str) -> None:
+    """Drop the cached mirror that served `url`, so the next call re-probes and fails over."""
+    for purpose, dom in _working_domain.items():
+        if dom and dom in url:
+            _probe_report[dom] = f"{purpose}: fetch-failed ({cause})"
+            _working_domain[purpose] = None
 
 
 def _upstream_error(action: str = "reach a mirror") -> str:
@@ -134,7 +166,9 @@ def _upstream_error(action: str = "reach a mirror") -> str:
     def _blocked(c: str) -> bool:
         return c in ("anti-bot-challenge", "200-but-no-results") or c.startswith("http-40")
 
-    reachable = [c for c in _probe_report.values() if c != "dns-dead" and not c.startswith("unreachable")]
+    # Causes are recorded as "<purpose>: <cause>"; judge the cause, not the label.
+    causes = [c.split(": ", 1)[-1] for c in _probe_report.values()]
+    reachable = [c for c in causes if c != "dns-dead" and not c.startswith("unreachable")]
     if reachable and all(_blocked(c) for c in reachable):
         hint = (" Every reachable mirror is behind an anti-bot challenge requiring JS execution."
                 " That is an access control, not a transport fault — retrying will not help."
@@ -151,29 +185,80 @@ def _get_secret_key() -> str | None:
 
 
 def _get_download_path() -> Path:
-    p = Path(os.environ.get("ANNAS_DOWNLOAD_PATH", os.path.expanduser("~/Downloads/annas-archive")))
+    # Default is the Staging landing zone, NEVER ~/Downloads or a project tree: those are
+    # Spotlight-indexed, and downloads into an indexed tree are the documented trigger of the
+    # 2026-08-26 kernel panic (Bulk Download Policy, Project_Aion/CLAUDE.md).
+    p = Path(os.environ.get("ANNAS_DOWNLOAD_PATH", os.path.expanduser("~/Claude/Staging/incoming/annas-archive")))
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def _fetch(url: str) -> str | None:
-    """Fetch a URL, INVALIDATING the cached mirror on failure.
+def _http(url: str, timeout: int = 30) -> tuple[int | None, str, str]:
+    """GET `url` -> (status, body, content_type). status None = transport failure (body = cause).
 
-    Previously a cached domain was permanent: once `_working_domain` was set, every later
-    request went to it forever, and a bare `except: return None` erased the reason. So a mirror
-    that started failing after selection failed for the remainder of the process lifetime with
-    no cause and no failover. Clearing the cache lets the next call re-probe and move on.
+    KEEPS THE BODY OF AN HTTP ERROR. The member API reports its errors as non-200 statuses with a
+    JSON `error` field ("Record not found", quota, bad key). Discarding the body on HTTPError, as
+    `_fetch` used to, turned every one of those into an unexplained UPSTREAM_UNAVAILABLE.
+    The URL may carry the member key, so it never appears in a returned cause.
     """
-    global _working_domain
     req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8")
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        if _working_domain and _working_domain in url:
-            _probe_report[_working_domain] = f"fetch-failed ({getattr(e, 'code', None) or getattr(e, 'reason', 'error')})"
-            _working_domain = None
-        return None
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace"), resp.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        return e.code, body, (e.headers.get("Content-Type", "") if e.headers else "")
+    except urllib.error.URLError as e:
+        reason = str(getattr(e, "reason", e))
+        if "Name or service not known" in reason or "nodename nor servname" in reason:
+            return None, "dns-dead", ""
+        return None, f"unreachable ({reason[:40]})", ""
+    except Exception as e:  # noqa: BLE001 — cause is reported, never swallowed
+        return None, f"error ({type(e).__name__})", ""
+
+
+def _fetch(url: str) -> str | None:
+    """Fetch an HTML page, INVALIDATING the cached mirror on failure.
+
+    Previously a cached domain was permanent: once selected, every later request went to it
+    forever, and a bare `except: return None` erased the reason. Clearing the cache lets the next
+    call re-probe and move on.
+    """
+    status, body, _ = _http(url)
+    if status == 200:
+        return body
+    _invalidate(url, f"http-{status}" if status else body)
+    return None
+
+
+def _api_json(path: str, params: dict) -> tuple[int | None, dict | None, str]:
+    """Call the member JSON API on the API mirror -> (status, parsed_json, cause).
+
+    A JSON reply is an ANSWER whatever its status (404 "Record not found" is the API working),
+    so it never invalidates the mirror. Only a transport failure or a non-JSON reply does.
+    """
+    base = _get_base_url("api")
+    if base is None:
+        return None, None, "no-api-mirror"
+    url = f"{base}{path}?{urllib.parse.urlencode(params)}"
+    status, body, ctype = _http(url)
+    if status is not None and "json" in ctype:
+        try:
+            data = json.loads(body)
+            # /db wraps its error object as a JSON STRING ("\"{\\"error\\": ...}\"")
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    data = {"error": data}
+            return status, data if isinstance(data, dict) else {"value": data}, "ok"
+        except json.JSONDecodeError:
+            pass
+    _invalidate(url, f"http-{status}" if status else body)
+    return status, None, (f"http-{status}-not-json" if status else body)
 
 
 def _parse_search_results(html: str, limit: int = 10) -> list[dict]:
@@ -297,7 +382,7 @@ def searchBook(
         return _upstream_error("search for books")
 
     results = _parse_search_results(html, limit=min(limit, 20))
-    return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain})
+    return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain["search"]})
 
 
 @mcp.tool()
@@ -333,7 +418,7 @@ def searchJournal(
         return _upstream_error("search for journal articles")
 
     results = _parse_search_results(html, limit=min(limit, 20))
-    return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain})
+    return json.dumps({"results": results, "count": len(results), "query": search_query, "mirror": _working_domain["search"]})
 
 
 def _parse_md5_page(md5: str, html: str) -> dict:
@@ -412,23 +497,30 @@ def info(md5: str) -> str:
     Args:
         md5: 32-character MD5 hash from a search result
     """
-    base = _get_base_url()
-    if base is None:
+    # /db is a JSON endpoint on the API mirror. Measured 2026-10-09: it answers 403 "Not a
+    # member" with or without `?key=` — it wants a logged-in member SESSION, which the API key
+    # is not. The /md5/ HTML fallback is behind the same DDoS-Guard challenge as /search. When
+    # both are closed, say so: a gated record is not a missing one.
+    status, data, cause = _api_json(f"/db/aarecord_elasticsearch/md5:{md5}.json", {})
+    if data is None and status is None:
         return _upstream_error("fetch metadata")
-    url = f"{base}/db/aarecord_elasticsearch/md5:{md5}.json"
-    raw = _fetch(url)
-
-    if not raw:
-        url_fallback = f"{base}/md5/{md5}"
-        html = _fetch(url_fallback)
-        if not html:
-            return json.dumps({"error": "NOT_FOUND", "md5": md5})
-        return json.dumps(_parse_md5_page(md5, html))
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return json.dumps({"error": "PARSE_ERROR", "md5": md5})
+    if data is not None and data.get("error"):
+        gated = "member" in str(data["error"]).lower()
+        base = _get_base_url("search")
+        html = _fetch(f"{base}/md5/{md5}") if base else None
+        if html and re.search(r"text-violet-900|<title>", html):
+            return json.dumps(_parse_md5_page(md5, html))
+        return json.dumps({
+            "error": "METADATA_GATED" if gated else "NOT_FOUND",
+            "md5": md5,
+            "message": ("Metadata is closed from this machine: /db/aarecord_elasticsearch requires a "
+                        "logged-in member session (the API key is not accepted there), and the /md5/ "
+                        "page is behind an anti-bot JS challenge. Downloads still work: fastDownload "
+                        "and downloadBook use the member API, which is open.") if gated
+                       else str(data["error"]),
+        })
+    if data is None:
+        return json.dumps({"error": "PARSE_ERROR", "md5": md5, "cause": cause})
 
     fud = data.get("file_unified_data", {})
     additional = data.get("additional", {})
@@ -467,6 +559,34 @@ def info(md5: str) -> str:
     return json.dumps(result)
 
 
+def _fast_download_url(md5: str, key: str, path_index: int = 0, domain_index: int = 0) -> dict:
+    """Ask the member API for a download URL. One implementation for fastDownload and downloads.
+
+    The API reports failures as non-200 statuses WITH a JSON `error`; each maps to a named error
+    here instead of collapsing into UPSTREAM_UNAVAILABLE.
+    """
+    status, data, cause = _api_json("/dyn/api/fast_download.json",
+                                    {"md5": md5, "key": key, "path_index": path_index, "domain_index": domain_index})
+    if data is None:
+        if cause == "no-api-mirror":
+            return {"upstream": _upstream_error("request a fast download")}
+        return {"error": "UPSTREAM_UNAVAILABLE", "md5": md5, "cause": cause}
+    err = data.get("error")
+    if err:
+        low = str(err).lower()
+        if "not found" in low:
+            return {"error": "NOT_FOUND", "md5": md5, "message": err}
+        if "quota" in low or "limit" in low:
+            return {"error": "QUOTA_EXHAUSTED", "message": err, "downloads_this_session": _download_count}
+        if "member" in low or "key" in low:
+            return {"error": "AUTH_INVALID", "message": err}
+        return {"error": "API_ERROR", "message": err, "status": status}
+    url = data.get("download_url")
+    if not url:
+        return {"error": "NO_DOWNLOAD_URL", "md5": md5}
+    return {"download_url": url, "md5": md5}
+
+
 @mcp.tool()
 def fastDownload(md5: str, path_index: int = 0, domain_index: int = 0) -> str:
     """Get a fast download URL for a book or journal (member only).
@@ -483,32 +603,10 @@ def fastDownload(md5: str, path_index: int = 0, domain_index: int = 0) -> str:
     if not key:
         return json.dumps({"error": "AUTH_REQUIRED", "message": "ANNAS_SECRET_KEY environment variable not set"})
 
-    params = {"md5": md5, "key": key, "path_index": path_index, "domain_index": domain_index}
-    base = _get_base_url()
-    if base is None:
-        return _upstream_error("request a fast download")
-    url = f"{base}/dyn/api/fast_download.json?{urllib.parse.urlencode(params)}"
-
-    raw = _fetch(url)
-    if not raw:
-        return json.dumps({"error": "UPSTREAM_UNAVAILABLE", "md5": md5})
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return json.dumps({"error": "PARSE_ERROR", "md5": md5, "raw": raw[:200]})
-
-    if data.get("error"):
-        error_msg = data["error"]
-        if "member" in error_msg.lower():
-            return json.dumps({"error": "AUTH_INVALID", "message": error_msg})
-        return json.dumps({"error": "API_ERROR", "message": error_msg})
-
-    download_url = data.get("download_url")
-    if not download_url:
-        return json.dumps({"error": "NO_DOWNLOAD_URL", "md5": md5, "response": data})
-
-    return json.dumps({"download_url": download_url, "md5": md5})
+    res = _fast_download_url(md5, key, path_index, domain_index)
+    if "upstream" in res:
+        return res["upstream"]
+    return json.dumps(res)
 
 
 def _sanitize_path_component(s: str) -> str:
@@ -518,28 +616,33 @@ def _sanitize_path_component(s: str) -> str:
     return s[:120] if s else "Unknown"
 
 
-def _resolve_organized_dest(md5: str, base_dir: Path) -> tuple[Path, str | None, str | None]:
-    """Look up metadata and return (dest_dir, author, title) for organized storage."""
+def _resolve_organized_dest(md5: str, base_dir: Path) -> tuple[Path, str | None, str | None, str]:
+    """Look up metadata and return (dest_dir, author, title, note) for organized storage.
+
+    The note says whether the file was organized and, if not, WHY. It used to fall back to the
+    flat base directory silently when metadata was unavailable, so "organized" downloads could
+    land unorganized with nothing in the result to say so.
+    """
     raw = info(md5)
     try:
         meta = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        return base_dir, None, None
+        return base_dir, None, None, "flat: metadata unparseable"
 
     if meta.get("error"):
-        return base_dir, None, None
+        return base_dir, None, None, f"flat: metadata {meta['error']}"
 
     author = meta.get("author", "").strip()
     title = meta.get("title", "").strip()
 
     if not author and not title:
-        return base_dir, None, None
+        return base_dir, None, None, "flat: metadata has no author or title"
 
     author_dir = _sanitize_path_component(author) if author else "Unknown Author"
     title_dir = _sanitize_path_component(title) if title else md5
 
     dest = base_dir / author_dir / title_dir
-    return dest, author, title
+    return dest, author, title, "organized by author/title"
 
 
 def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0, domain_index: int = 0, organize: bool = True) -> dict:
@@ -554,39 +657,20 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
     if not key:
         return {"error": "AUTH_REQUIRED", "message": "ANNAS_SECRET_KEY not set"}
 
-    params = {"md5": md5, "key": key, "path_index": path_index, "domain_index": domain_index}
-    base = _get_base_url()
-    if base is None:
-        return json.loads(_upstream_error("request a fast download"))
-    api_url = f"{base}/dyn/api/fast_download.json?{urllib.parse.urlencode(params)}"
-
-    raw = _fetch(api_url)
-    if not raw:
-        return {"error": "UPSTREAM_UNAVAILABLE", "md5": md5}
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"error": "PARSE_ERROR", "md5": md5}
-
-    if data.get("error"):
-        err = data["error"]
-        if "quota" in err.lower() or "limit" in err.lower():
-            return {"error": "QUOTA_EXHAUSTED", "message": err, "downloads_this_session": _download_count}
-        if "member" in err.lower() or "key" in err.lower():
-            return {"error": "AUTH_INVALID", "message": err}
-        return {"error": "API_ERROR", "message": err}
-
-    download_url = data.get("download_url")
-    if not download_url:
-        return {"error": "NO_DOWNLOAD_URL", "md5": md5}
+    res = _fast_download_url(md5, key, path_index, domain_index)
+    if "upstream" in res:
+        return json.loads(res["upstream"])
+    if res.get("error"):
+        return res
+    download_url = res["download_url"]
 
     base_dest = output_dir or _get_download_path()
     author_name = None
     title_name = None
+    organized_note = "organize=False"
 
     if organize:
-        dest, author_name, title_name = _resolve_organized_dest(md5, base_dest)
+        dest, author_name, title_name, organized_note = _resolve_organized_dest(md5, base_dest)
     else:
         dest = base_dest
 
@@ -609,6 +693,7 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
             "title": title_name,
             "skipped": True,
             "message": "File already exists",
+            "organized": organized_note,
         }
 
     try:
@@ -623,6 +708,7 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
             "title": title_name,
             "filesize_bytes": filepath.stat().st_size,
             "downloads_this_session": _download_count,
+            "organized": organized_note,
         }
     except Exception as e:
         tmp_path.unlink(missing_ok=True)
@@ -683,7 +769,9 @@ def memberDownload(md5: str, output_path: str | None = None) -> str:
     dest = Path(output_path) if output_path else None
     result = _download_file(md5, output_dir=dest)
 
-    result["member_key_prefix"] = key[:8] + "..."
+    # Was key[:8] + "...": eight characters of a paid secret in every tool result, which lands
+    # in transcripts and logs. Whether a key is set is all a caller needs to know.
+    result["member_key"] = "set"
     result["downloads_this_session"] = _download_count
     result["quota_note"] = "Quota resets on a rolling 18-hour window"
 
