@@ -9,7 +9,7 @@
 
 **An MCP server for programmatic book and article retrieval from Anna's Archive** — the world's largest open-source shadow library aggregator (169M+ indexed files across Libgen, Z-Library, Sci-Hub, Internet Archive, and direct uploads).
 
-AnnasTools exposes 8 tools over the [Model Context Protocol](https://modelcontextprotocol.io/), enabling any MCP-compatible AI assistant (Claude Code, Claude Desktop, Cursor, etc.) to search for books and academic papers, retrieve detailed metadata, and download files using a paid member account.
+AnnasTools exposes 12 tools over the [Model Context Protocol](https://modelcontextprotocol.io/), enabling any MCP-compatible AI assistant (Claude Code, Claude Desktop, Cursor, etc.) to search for books and academic papers, retrieve detailed metadata, and download files using a paid member account.
 
 ---
 
@@ -23,7 +23,7 @@ AnnasTools bridges that gap with a pure-Python MCP server that:
 - **Scrapes search results** from the HTML frontend with regex-based extraction
 - **Parses metadata pages** into structured JSON with 12+ fields (title, author, publisher, ISBNs, DOIs, description, cover URL, filesize, language, format)
 - **Authenticates via member key** for the `fast_download.json` API — the only reliable programmatic download path
-- **Handles mirror failover** across 6 domain mirrors automatically
+- **Handles mirror failover** across 5 domain mirrors automatically
 - **Writes files atomically** (temp file → rename) to prevent partial downloads on network interruption
 
 ---
@@ -52,9 +52,9 @@ AnnasTools bridges that gap with a pure-Python MCP server that:
 │    (regex)         fallback chain          (member key auth)  │
 │         │               │                     │               │
 ├─────────┴───────────────┴─────────────────────┴───────────────┤
-│                   Anna's Archive (6 mirrors)                   │
+│                   Anna's Archive (5 mirrors)                   │
 │                                                                │
-│  annas-archive.gl  .org  .li  .se  .pk  .gd                  │
+│  annas-archive.gl  .org  .se  .pk  .gd                       │
 │                                                                │
 │  Search: /search?q=...  (HTML, scraped)                       │
 │  Detail: /md5/{hash}    (HTML, parsed for 12+ fields)         │
@@ -174,12 +174,17 @@ When the ElasticSearch JSON endpoint succeeds (rarer), the response includes add
 ```json
 {
   "success": true,
-  "filepath": "/Users/you/Downloads/annas-archive/Clean Code... .epub",
+  "filepath": "/Users/you/Claude/Staging/incoming/annas-archive/Clean Code... .epub",
   "filename": "Clean Code... .epub",
   "filesize_bytes": 17605338,
   "downloads_this_session": 1
 }
 ```
+
+**Quota.** The member API *is* the Fast Download: it draws on the same counter as the website's fast-download
+button. Measured 2026-10-30 on a paid membership: 25 downloads per rolling 18 hours; the 26th returns HTTP 429
+`{"error": "No downloads left"}` (mapped to `QUOTA_EXHAUSTED`). Every API answer that carries the account block
+passes it through as `account_fast_download_info`, so callers can see the remaining quota.
 
 **Error codes** (all download tools):
 
@@ -187,7 +192,7 @@ When the ElasticSearch JSON endpoint succeeds (rarer), the response includes add
 |------|---------|
 | `AUTH_REQUIRED` | `ANNAS_SECRET_KEY` env var not set |
 | `AUTH_INVALID` | Member key rejected by Anna's Archive |
-| `QUOTA_EXHAUSTED` | Download quota exceeded (resets on 18-hour rolling window) |
+| `QUOTA_EXHAUSTED` | Download quota exceeded: HTTP 429 / `"No downloads left"` (resets on an 18-hour rolling window) |
 | `UPSTREAM_UNAVAILABLE` | All mirror domains unreachable |
 | `NO_DOWNLOAD_URL` | API returned success but no download URL |
 | `DOWNLOAD_FAILED` | Network error during file transfer |
@@ -226,7 +231,7 @@ Add to your project's `.mcp.json`:
       "args": ["/path/to/AnnasTools/src/annas_tools/mcp_server.py"],
       "env": {
         "ANNAS_SECRET_KEY": "your-member-secret-key",
-        "ANNAS_DOWNLOAD_PATH": "~/Downloads/annas-archive"
+        "ANNAS_DOWNLOAD_PATH": "~/Claude/Staging/incoming/annas-archive"
       }
     }
   }
@@ -247,7 +252,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "args": ["/path/to/AnnasTools/src/annas_tools/mcp_server.py"],
       "env": {
         "ANNAS_SECRET_KEY": "your-member-secret-key",
-        "ANNAS_DOWNLOAD_PATH": "~/Downloads/annas-archive"
+        "ANNAS_DOWNLOAD_PATH": "~/Claude/Staging/incoming/annas-archive"
       }
     }
   }
@@ -259,7 +264,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ANNAS_SECRET_KEY` | For downloads | (none) | Member account secret key from Anna's Archive settings |
-| `ANNAS_DOWNLOAD_PATH` | No | `~/Downloads/annas-archive` | Directory for downloaded files |
+| `ANNAS_DOWNLOAD_PATH` | No | `~/Claude/Staging/incoming/annas-archive` | Directory for downloaded files. Keep it OUT of Spotlight-indexed / backed-up trees (not `~/Downloads`): bulk downloads into an indexed tree triggered a kernel panic on 2026-08-26 |
 
 ---
 
@@ -295,7 +300,9 @@ Every existing implementation in the ecosystem (Go, Rust, Python, Dart) scrapes 
 On first request, the server probes 6 known mirror domains in order until one responds with HTTP 200. The working domain is cached for the lifetime of the process. Mirror list:
 
 ```
-annas-archive.gl → .org → .li → .se → .pk → .gd
+annas-archive.gl → .org → .se → .pk → .gd
+
+(`annas-archive.li` was removed 2026-08-15: it is a parked lookalike, not Anna's Archive.)
 ```
 
 ### Atomic File Writes
@@ -344,7 +351,7 @@ User: "Find and download Clean Code by Robert Martin in EPUB format"
    → Returns full metadata: 2025 2nd edition, Pearson, ISBN 9780135398586
 
 3. downloadBook(md5="ba3e5c873982e0a623b27333916f6e2a")
-   → Downloads 17 MB EPUB to ~/Downloads/annas-archive/
+   → Downloads 17 MB EPUB to ~/Claude/Staging/incoming/annas-archive/
 ```
 
 ### Look Up an Academic Paper by DOI
@@ -380,7 +387,7 @@ The persona picks up the task, searches, downloads, and closes it with results.
 AnnasTools/
 ├── src/
 │   └── annas_tools/
-│       └── mcp_server.py          # MCP server — 8 tools, ~570 LOC
+│       └── mcp_server.py          # MCP server — 12 tools
 ├── tests/                          # Test directory (download artifacts)
 ├── docs/                           # Documentation assets
 ├── pyproject.toml                  # Package metadata and dependencies

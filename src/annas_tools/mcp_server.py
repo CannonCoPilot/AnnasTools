@@ -571,20 +571,28 @@ def _fast_download_url(md5: str, key: str, path_index: int = 0, domain_index: in
         if cause == "no-api-mirror":
             return {"upstream": _upstream_error("request a fast download")}
         return {"error": "UPSTREAM_UNAVAILABLE", "md5": md5, "cause": cause}
+    # The API's own account block (downloads left, per-day limit). Passed through on every answer
+    # that carries it: the caller has no other way to see the remaining quota.
+    acct = data.get("account_fast_download_info")
+    acct_part = {"account_fast_download_info": acct} if acct is not None else {}
     err = data.get("error")
     if err:
         low = str(err).lower()
         if "not found" in low:
-            return {"error": "NOT_FOUND", "md5": md5, "message": err}
-        if "quota" in low or "limit" in low:
-            return {"error": "QUOTA_EXHAUSTED", "message": err, "downloads_this_session": _download_count}
+            return {"error": "NOT_FOUND", "md5": md5, "message": err, **acct_part}
+        # The live quota answer is HTTP 429 {"error": "No downloads left"} (measured 2026-10-30 by
+        # W12 after 25 successes): it names neither "quota" nor "limit", so it fell through to
+        # API_ERROR and memberDownload's quota fallback never ran. Status 429 is the signal.
+        if status == 429 or "no downloads left" in low or "quota" in low or "limit" in low:
+            return {"error": "QUOTA_EXHAUSTED", "message": err, "status": status,
+                    "downloads_this_session": _download_count, **acct_part}
         if "member" in low or "key" in low:
-            return {"error": "AUTH_INVALID", "message": err}
-        return {"error": "API_ERROR", "message": err, "status": status}
+            return {"error": "AUTH_INVALID", "message": err, **acct_part}
+        return {"error": "API_ERROR", "message": err, "status": status, **acct_part}
     url = data.get("download_url")
     if not url:
-        return {"error": "NO_DOWNLOAD_URL", "md5": md5}
-    return {"download_url": url, "md5": md5}
+        return {"error": "NO_DOWNLOAD_URL", "md5": md5, **acct_part}
+    return {"download_url": url, "md5": md5, **acct_part}
 
 
 @mcp.tool()
@@ -663,6 +671,7 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
     if res.get("error"):
         return res
     download_url = res["download_url"]
+    acct_part = {k: res[k] for k in ("account_fast_download_info",) if k in res}
 
     base_dest = output_dir or _get_download_path()
     author_name = None
@@ -694,6 +703,7 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
             "skipped": True,
             "message": "File already exists",
             "organized": organized_note,
+            **acct_part,
         }
 
     try:
@@ -709,6 +719,7 @@ def _download_file(md5: str, output_dir: Path | None = None, path_index: int = 0
             "filesize_bytes": filepath.stat().st_size,
             "downloads_this_session": _download_count,
             "organized": organized_note,
+            **acct_part,
         }
     except Exception as e:
         tmp_path.unlink(missing_ok=True)
