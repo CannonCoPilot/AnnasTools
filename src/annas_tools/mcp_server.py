@@ -804,26 +804,53 @@ def lookupDoi(doi: str) -> str:
     Args:
         doi: Digital Object Identifier (e.g., 10.1038/nature12373)
     """
+    md5s: list[str] = []
     base = _get_base_url()
-    if base is None:
-        return _upstream_error("reach SciDB")
-    url = f"{base}/scidb/{urllib.parse.quote(doi, safe='')}"
-    html = _fetch(url)
-
-    if not html:
-        return json.dumps({"error": "UPSTREAM_UNAVAILABLE", "doi": doi})
-
-    md5s = list(dict.fromkeys(re.findall(r'/md5/([a-f0-9]{32})', html)))
+    if base is not None:
+        html = _fetch(f"{base}/scidb/{urllib.parse.quote(doi, safe='')}")
+        if html:
+            md5s = list(dict.fromkeys(re.findall(r'/md5/([a-f0-9]{32})', html)))
+    source = "scidb"
     if not md5s:
-        return json.dumps({"error": "NOT_FOUND", "doi": doi, "message": "No files found for this DOI"})
+        # SciDB is behind DDoS-Guard (measured 16 Nov 2026 on .gl/.pk/.gd). Library Genesis indexes the same
+        # scientific-article files under the same md5 and answers without a challenge, so resolve DOI -> md5 there.
+        # The md5 then goes to fastDownload / downloadJournal (member API, not challenge-gated).
+        md5s, source = _libgen_md5s(doi), "libgen"
+    if not md5s:
+        return json.dumps({"error": "NOT_FOUND", "doi": doi, "message": "No files found for this DOI (SciDB and LibGen)"})
 
     results = []
     for md5 in md5s[:3]:
-        detail = json.loads(info(md5))
-        if not detail.get("error"):
-            results.append(detail)
+        detail = json.loads(info(md5)) if source == "scidb" else {}
+        if detail.get("error") or not detail:
+            detail = {"md5": md5, "doi": doi, "source": source,
+                      "next": "downloadJournal(md5) via the member API"}
+        results.append(detail)
 
-    return json.dumps({"doi": doi, "results": results, "count": len(results)})
+    return json.dumps({"doi": doi, "results": results, "count": len(results), "md5_source": source})
+
+
+LIBGEN_DOMAINS = ["libgen.li", "libgen.gl", "libgen.bz"]
+
+
+def _libgen_md5s(doi: str) -> list[str]:
+    """DOI -> file md5s via Library Genesis: index.php?req=<doi> gives edition ids whose DOI line matches; each
+    edition page links ads.php?md5=<file md5>. The page also carries an ad-network key of the same shape, which is
+    why only the ads.php link is read."""
+    for dom in LIBGEN_DOMAINS:
+        status, page, _ = _http(f"https://{dom}/index.php?req={urllib.parse.quote(doi, safe='/')}")
+        if status != 200 or not page:
+            continue
+        ids = [m.group(1) for m in re.finditer(
+            r'href="edition\.php\?id=(\d+)"[^>]*>\s*<i><font[^>]*>DOI:\s*([^<]+)</font>', page)
+            if m.group(2).strip().lower() == doi.lower()]
+        out: list[str] = []
+        for i in dict.fromkeys(ids):
+            st, ed, _ = _http(f"https://{dom}/edition.php?id={i}")
+            if st == 200 and ed:
+                out += [x.lower() for x in re.findall(r"ads\.php\?md5=([0-9a-fA-F]{32})", ed)]
+        return list(dict.fromkeys(out))
+    return []
 
 
 @mcp.tool()
